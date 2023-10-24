@@ -1,0 +1,167 @@
+---
+title: "Dew Point Pitching"
+output: html_document
+date: "2023-10-12"
+---
+
+```{r, include=FALSE}
+# Install libraries
+library(tidyverse)
+library(moments)
+library(randomForest)
+```
+
+```{r}
+# Load the data
+data <- read.csv("data.csv", stringsAsFactors = TRUE)
+
+# Observe the size, variables, data types, and numerical summaries of the dataset
+glimpse(data)
+summary(data)
+```
+
+```{r}
+# Create a box plot and calculate skewness for columns of interest
+columns <- c("INDUCED_VERTICAL_BREAK", "HORIZONTAL_BREAK", "SPIN_RATE_ABSOLUTE", "RELEASE_SPEED", "HORIZONTAL_APPROACH_ANGLE", "VERTICAL_APPROACH_ANGLE")
+
+for (column in columns) {
+  plot <- ggplot(data, aes(.data[[column]]))+
+    geom_boxplot()+
+    labs(x = column)
+  skew <- skewness(data[[column]])
+  print(plot)
+  cat(column, "skewness:", skew, "\n")
+}
+```
+
+```{r}
+# Check for missingness
+sum(is.na(data))
+
+# Calculate the number of pitchers in the dataset
+length(unique(data$PITCHER_KEY))
+
+# Observe different pitch types
+ggplot(data, aes(PITCH_TYPE_TRACKED_KEY, fill = PITCH_TYPE_TRACKED_KEY))+
+  geom_bar(show.legend = F)+
+  geom_text(stat = "count", aes(label = after_stat(count), vjust = -1))+
+  ylim(0,3500)+
+  labs(title = "Distribution of Pitch Types", y = "Frequency", x = "Pitch Type")
+```
+
+
+```{r}
+# Calculate the average metrics for each type of pitch for each pitcher
+avg_metrics <- data %>%
+  group_by(PITCHER_KEY, PITCH_TYPE_TRACKED_KEY) %>%
+  summarise(
+    AVG_IVB = mean(INDUCED_VERTICAL_BREAK, na.rm = TRUE),
+    AVG_HB = mean(HORIZONTAL_BREAK, na.rm = TRUE))
+
+# Merge the original data with the average metrics
+merged_data <- merge(data, avg_metrics, by = c("PITCHER_KEY", "PITCH_TYPE_TRACKED_KEY"))
+
+# Calculate the difference between observed and mean value for each metric
+merged_data$DIFF_IVB <- with(merged_data, abs(INDUCED_VERTICAL_BREAK) - abs(AVG_IVB))
+merged_data$DIFF_HB <- with(merged_data, abs(HORIZONTAL_BREAK) - abs(AVG_HB))
+```
+
+```{r}
+# Plot the differences in IVB and HB for fastballs
+merged_data %>% 
+  group_by(PITCHER_KEY) %>% 
+  filter(PITCH_TYPE_TRACKED_KEY=="FB") %>% 
+  ggplot(aes(DIFF_IVB))+
+  geom_boxplot()+
+  labs(title = "Distribution of IVB Differences for Fastballs", x = "Difference in Induced Vertical Break")
+
+merged_data %>% 
+  group_by(PITCHER_KEY) %>% 
+  filter(PITCH_TYPE_TRACKED_KEY=="FB") %>% 
+  ggplot(aes(DIFF_HB))+
+  geom_boxplot()+
+  labs(title = "Distribution of HB Differences for Fastballs", x = "Difference in Horizontal Break")
+
+```
+
+```{r}
+# Calculate the sums for each condition
+sum_both_negative <- sum(ifelse(merged_data$DIFF_IVB < 0 & merged_data$DIFF_HB < 0, 1, 0))
+sum_ivb_positive_hb_negative <- sum(ifelse(merged_data$DIFF_IVB > 0 & merged_data$DIFF_HB < 0, 1, 0))
+sum_ivb_negative_hb_positive <- sum(ifelse(merged_data$DIFF_IVB < 0 & merged_data$DIFF_HB > 0, 1, 0))
+sum_both_positive <- sum(ifelse(merged_data$DIFF_IVB > 0 & merged_data$DIFF_HB > 0, 1, 0))
+
+# Create a vector with these sums
+slices <- c(sum_both_negative, sum_ivb_positive_hb_negative, sum_ivb_negative_hb_positive, sum_both_positive)
+
+# Create a vector with labels
+lbls <- c("Both Negative", "IVB Positive & HB Negative", "IVB Negative & HB Positive", "Both Positive")
+
+# Generate the pie chart
+pie(slices, labels = lbls, main="IVB and HB Differences")
+
+```
+
+```{r}
+# Create target variable by summing the differences
+merged_data$DEWPOINT_AFFECTED <- with(merged_data, ifelse(DIFF_IVB + DIFF_HB < 0, DIFF_IVB + DIFF_HB, 0))
+
+# Convert to probability using normalization
+max_diff <- min(merged_data$DEWPOINT_AFFECTED)
+merged_data$DEWPOINT_AFFECTED <- merged_data$DEWPOINT_AFFECTED / max_diff
+
+# Histogram of probabilities
+hist(merged_data$DEWPOINT_AFFECTED)
+summary(merged_data$DEWPOINT_AFFECTED)
+```
+
+```{r}
+set.seed(10) # for reproducible results
+
+# Randomly select 70% of the rows 
+train_index <- sample(1:nrow(merged_data), .7*nrow(merged_data))
+
+# Index the training and test data
+train_data <- merged_data[train_index,]
+test_data <- merged_data[-train_index,]
+```
+
+```{r}
+# Plot the differences in horizontal and vertical movement versus dew point probabilities
+ggplot(merged_data, aes(DIFF_HB, DEWPOINT_AFFECTED))+
+  geom_point()
+cor(merged_data$DIFF_HB, merged_data$DEWPOINT_AFFECTED) # calculate correlation coefficient
+
+ggplot(merged_data, aes(DIFF_IVB, DEWPOINT_AFFECTED))+
+  geom_point()
+cor(merged_data$DIFF_IVB, merged_data$DEWPOINT_AFFECTED) # calculate correlation coefficient
+
+# Fit the multiple linear regression model to training data
+mlr_model <- lm(DEWPOINT_AFFECTED ~ DIFF_IVB + DIFF_HB, train_data)
+# Make predictions on test data using trained model
+mlr_predictions_test <- predict(mlr_model, newdata = test_data)
+# Extract actual probabilities and plot against the predicted probabilities
+test_actual <- test_data$DEWPOINT_AFFECTED
+plot(mlr_predictions_test, test_actual)
+
+# Model evaluation and diagnostic plots
+summary(mlr_model)
+plot(mlr_model)
+```
+
+```{r}
+# Fit random forests model to training data
+rf_model <- randomForest(DEWPOINT_AFFECTED ~ DIFF_HB + DIFF_IVB, data = train_data, ntree=100)
+rf_predictions_test <- predict(rf_model, newdata = test_data)
+plot(test_actual, rf_predictions_test)
+
+# Evaluate random forests model
+print(rf_model)
+```
+
+```{r}
+# Create submission.csv file with predicted DEWPOINT_AFFECTED probabilities
+data.frame("PID" = merged_data$PID, 
+           "DEWPOINT_AFFECTED" = predict(rf_model, newdata = merged_data)) %>% write_csv(., "submission.csv")
+
+```
